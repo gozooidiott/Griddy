@@ -1,3 +1,5 @@
+# Griddy
+
 # GridXAUUSD: Grid EA untuk MetaTrader 5
 
 Expert Advisor grid untuk XAUUSD, dirancang untuk **akun cent hedging** bermodal kecil
