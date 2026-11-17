@@ -1,14 +1,37 @@
 # Griddy
 
-# GridXAUUSD v2.00 — Grid EA untuk MetaTrader 5
+# GridXAUUSD v2.10 — Grid EA untuk MetaTrader 5
 
 Expert Advisor grid untuk XAUUSD yang membaca **struktur pasar** (swing, BOS/CHoCH),
-langkah & take profit adaptif ATR, lot berbasis risiko memakai nilai tick broker,
-serta circuit breaker berbasis high-water mark equity.
+langkah & take profit adaptif ATR, lot dari risiko grid penuh memakai nilai tick broker,
+grid stop (SL bersama per arah), filter berita kalender MT5, serta circuit breaker
+berbasis high-water mark equity.
 
 > ⚠️ **Peringatan risiko.** Grid trading tidak menjamin profit. Saat emas bergerak satu
 > arah dalam jangka panjang, posisi yang melawan tren menumpuk dan bisa memicu stop
 > drawdown. Selalu uji dulu di Strategy Tester dan akun demo.
+
+## Yang berubah di v2.10
+
+- **Perbaikan bug BOS/CHoCH:** v2.00 membandingkan pivot terbaru dengan close bar *tertua*
+  di jendela data (`g_clBuf[0]`), bukan bar tertutup terakhir. Sekarang memakai bar tertutup
+  terakhir, jadi sinyal BOS/CHoCH dan entry BOS benar-benar mengikuti harga terkini.
+- **Lot dari risiko grid penuh:** `InpRiskPercent` sekarang berarti rugi maksimum bila
+  *seluruh* grid satu arah terisi lalu harga mencapai grid stop, bukan risiko per posisi.
+  Bila lot hasil hitungan di bawah lot minimum broker, EA memakai lot minimum dan mencetak
+  risiko sebenarnya di tab Experts.
+- **Grid stop (`InpUseGridStop`):** posisi pertama tiap arah menetapkan SL bersama sejauh
+  `n × step` dari entry (n = level maksimum). Semua level berikutnya memakai SL yang sama,
+  jadi rugi satu siklus grid terbatas. Posisi tanpa SL akan dipasangi SL ini; bila harga sudah
+  lewat, posisi ditutup. Setelah grid stop kena, EA menunggu `InpCooldownAfterStopMin` menit.
+- **HWM first-run:** saat pertama jalan (atau setelah reset), high-water mark = maks(balance,
+  equity) dan langsung disimpan, jadi rugi mengambang yang sudah ada tetap dihitung sebagai
+  drawdown. EA juga memperingatkan bila ada posisi lama milik EA, posisi lain di akun, atau
+  akun sedang rugi mengambang.
+- **Filter berita:** memakai kalender ekonomi bawaan MT5. Tidak membuka posisi baru
+  `InpNewsMinutesBefore` menit sebelum s/d `InpNewsMinutesAfter` menit sesudah rilis berita
+  high impact (opsional juga moderate) untuk `InpNewsCurrency`. Posisi yang sudah terbuka tidak
+  ditutup.
 
 ## Yang berubah dari v1
 
@@ -61,8 +84,9 @@ serta circuit breaker berbasis high-water mark equity.
 |---|---|---|
 | `InpMode` | `GRID_STRUCTURE` | `GRID_STRUCTURE` = searah struktur; `GRID_BOTH` = buy+sell |
 | `InpLot` | 0.01 | Lot tetap (dipakai bila lot risiko mati) |
-| `InpUseRiskLot` | true | Lot dihitung dari risiko per posisi |
-| `InpRiskPercent` | 1.0 | Risiko per posisi (% equity) |
+| `InpUseRiskLot` | true | Lot dihitung dari risiko grid penuh |
+| `InpRiskPercent` | 1.0 | Rugi grid penuh satu arah sampai grid stop (% equity) |
+| `InpUseGridStop` | true | SL bersama per arah, satu step setelah level terakhir |
 | `InpGridStepAtrMult` | 1.0 | Step grid = ATR × ini |
 | `InpGridStepMin` / `InpGridStepMax` | 1.0 / 25.0 | Batas step (harga) |
 | `InpTakeProfitAtrMult` | 1.5 | TP = ATR × ini |
@@ -81,6 +105,17 @@ serta circuit breaker berbasis high-water mark equity.
 | `InpMaxSpread` | 0.50 | Spread maksimum (harga) |
 | `InpHaltAfterStop` | true | Berhenti total setelah stop |
 | `InpResetHalt` | false | true sekali untuk lanjut setelah berhenti |
+| `InpCooldownAfterStopMin` | 60 | Jeda (menit) sebelum grid baru setelah grid stop kena |
+
+### Filter berita
+
+| Input | Default | Fungsi |
+|---|---|---|
+| `InpUseNewsFilter` | true | Jangan buka posisi di sekitar rilis berita |
+| `InpNewsCurrency` | USD | Mata uang berita yang dipantau |
+| `InpNewsHighOnly` | true | true = high impact saja; false = juga moderate |
+| `InpNewsMinutesBefore` | 30 | Menit sebelum rilis |
+| `InpNewsMinutesAfter` | 30 | Menit sesudah rilis |
 
 ### Sesi & lain-lain
 
@@ -96,21 +131,26 @@ serta circuit breaker berbasis high-water mark equity.
 ## Perhitungan lot berbasis risiko
 
 ```
-riskMoney  = equity × InpRiskPercent / 100
-riskDist   = max(step grid, ATR)
-ticks      = riskDist / SYMBOL_TRADE_TICK_SIZE
-lot        = riskMoney / (ticks × SYMBOL_TRADE_TICK_VALUE)
+n          = min(InpMaxLevelsPerSide, InpMaxTotalPositions)
+jarakTotal = step × n(n+1)/2        // level k berjarak (n−k) step ke grid stop
+rugiPerLot = jarakTotal / SYMBOL_TRADE_TICK_SIZE × SYMBOL_TRADE_TICK_VALUE
+lot        = equity × InpRiskPercent / 100 / rugiPerLot
 ```
 
-Lot lalu dibulatkan ke aturan broker (min/max/step). Catatan: `riskDist` adalah jarak ke
-level grid berikutnya, yaitu ukuran risiko per posisi; penumpukan grid tetap bisa
-memperbesar total risiko, jadi atur `InpMaxLevelsPerSide` dan `InpMaxTotalPositions`
-dengan bijak.
+Contoh: step $3, n = 5 → jarak total $45. Di akun cent (≈ 1 USC per $1 untuk 0.01 lot),
+rugi grid penuh dengan 0.01 lot ≈ 45 USC = 4,5% dari 1.000 USC. Dengan `InpRiskPercent = 1`
+lot hasil hitungan jatuh di bawah 0.01, jadi EA memakai 0.01 dan mencetak risiko sebenarnya
+(≈ 4,5%). Turunkan `InpMaxLevelsPerSide` bila angka itu terlalu besar.
+
+Rumus ini mengandaikan grid stop aktif. Bila `InpUseGridStop = false`, angka ini hanya rugi
+saat harga satu step melewati level terakhir; rugi bisa terus bertambah sampai stop DD.
 
 ## Pengaman bawaan
 
 | Pengaman | Fungsi |
 |---|---|
+| Grid stop | SL bersama per arah; rugi satu siklus grid terbatas, lalu jeda `InpCooldownAfterStopMin` |
+| Filter berita | Tidak buka posisi di sekitar rilis berita high impact (kalender MT5) |
 | Circuit breaker equity | Drawdown dari high-water mark equity ≥ `InpMaxEquityDrawdownPct` → tutup semua + halt |
 | Stop DD floating | Rugi mengambang ≥ `InpMaxDrawdownPct` dari balance → tutup semua + halt |
 | Batas level & total posisi | Posisi tidak bisa bertambah tanpa batas |
@@ -145,9 +185,17 @@ mereset high-water mark), lalu kembalikan ke `false`.
 
 ## Catatan
 
-- Versi ini sudah dikompile dengan MetaEditor: **0 errors, 0 warnings**.
+- v2.00 sudah dikompile dengan MetaEditor (0 errors, 0 warnings). **v2.10 belum dikompile** —
+  compile ulang di MetaEditor; kirim pesan error bila ada.
+- Filter berita butuh kalender ekonomi MT5, yang **tidak tersedia di Strategy Tester**: saat
+  backtest filter ini otomatis tidak aktif (EA mencetak pesan sekali). Jadi hasil backtest
+  tidak mencerminkan efek filter berita.
+- Upgrade dari v2.00 dengan posisi masih terbuka: posisi lama belum punya SL, dan v2.10 akan
+  memasang grid stop pada posisi itu (atau menutupnya bila harga sudah melewati level stop).
+  Paling aman upgrade saat tidak ada posisi terbuka.
 - Saat init, EA mencetak `contract size`, `tick value`, `tick size`, dan `point` di tab
   Experts — periksa angka itu cocok dengan brokermu.
 - Gunakan magic number berbeda bila menjalankan beberapa EA di akun yang sama.
-- Stop DD & circuit breaker hanya menghitung posisi milik EA ini (simbol + magic sama).
+- Stop DD floating hanya menghitung posisi milik EA ini (simbol + magic sama). Circuit
+  breaker equity memakai equity **seluruh akun**, jadi posisi manual/EA lain ikut memengaruhinya.
 - Komisi posisi tidak dimasukkan ke perhitungan rugi mengambang (swap sudah dimasukkan).

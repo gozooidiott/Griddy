@@ -1,13 +1,13 @@
 //+------------------------------------------------------------------+
 //|                                                   GridXAUUSD.mq5 |
-//|  Grid EA XAUUSD v2.00 - market-structure aware (MetaTrader 5).  |
+//|  Grid EA XAUUSD v2.10 - market-structure aware (MetaTrader 5).  |
 //|                                                                  |
 //|  PERINGATAN: Trading grid berisiko tinggi. Tidak ada jaminan     |
 //|  profit. Uji dulu di Strategy Tester dan akun demo.               |
 //+------------------------------------------------------------------+
 #property copyright "GridXAUUSD"
-#property version   "2.00"
-#property description "Grid EA XAUUSD v2: struktur pasar (swing/BOS/CHoCH), step & TP adaptif ATR, lot berbasis risiko, circuit breaker equity high-water mark."
+#property version   "2.10"
+#property description "Grid EA XAUUSD v2.1: struktur pasar (swing/BOS/CHoCH), step & TP adaptif ATR, lot dari risiko grid penuh, grid stop, filter berita, circuit breaker equity high-water mark."
 
 #include <Trade/Trade.mqh>
 
@@ -29,8 +29,9 @@ input double InpRangeAtrFrac    = 0.30;  // Range jika |EMAfast-EMAslow| < ATR*i
 input group "=== Grid ==="
 input ENUM_GRID_MODE InpMode             = GRID_STRUCTURE; // Mode arah grid
 input double InpLot                      = 0.01;  // Lot tetap (jika lot risiko mati)
-input bool   InpUseRiskLot               = true;  // Lot dihitung dari risiko per posisi
-input double InpRiskPercent              = 1.0;   // Risiko per posisi (% equity)
+input bool   InpUseRiskLot               = true;  // Lot dihitung dari risiko grid penuh
+input double InpRiskPercent              = 1.0;   // Risiko grid penuh satu arah sampai grid stop (% equity)
+input bool   InpUseGridStop              = true;  // SL bersama per arah, satu step di bawah/atas level terakhir
 input double InpGridStepAtrMult          = 1.0;   // Step grid = ATR * ini
 input double InpGridStepMin              = 1.0;   // Step minimum (harga)
 input double InpGridStepMax              = 25.0;  // Step maksimum (harga)
@@ -48,6 +49,15 @@ input double InpMinMarginLevel        = 500.0;// Margin level minimum (%) setela
 input double InpMaxSpread             = 0.50; // Spread maksimum (harga)
 input bool   InpHaltAfterStop         = true; // Berhenti total setelah stop
 input bool   InpResetHalt             = false;// true sekali untuk lanjut setelah berhenti
+input int    InpCooldownAfterStopMin  = 60;   // Jeda (menit) sebelum grid baru setelah grid stop kena
+
+//--- Berita
+input group "=== Filter Berita (kalender MT5) ==="
+input bool   InpUseNewsFilter         = true;  // Jangan buka posisi di sekitar rilis berita
+input string InpNewsCurrency          = "USD"; // Mata uang berita yang dipantau
+input bool   InpNewsHighOnly          = true;  // true = hanya berita high impact; false = juga moderate
+input int    InpNewsMinutesBefore     = 30;    // Menit sebelum rilis
+input int    InpNewsMinutesAfter      = 30;    // Menit sesudah rilis
 
 //--- Sesi
 input group "=== Sesi (waktu server broker) ==="
@@ -92,6 +102,11 @@ bool     g_halted      = false;
 string   g_haltVar     = "";
 string   g_hwmVar      = "";
 double   g_hwmEquity   = 0.0;
+bool     g_warnedMinLot = false;
+
+datetime g_newsTimes[];
+datetime g_newsNextRefresh = 0;
+bool     g_newsAvailable   = true;
 
 //+------------------------------------------------------------------+
 //| Bulaskan lot sesuai aturan broker                                |
@@ -204,33 +219,163 @@ void EnsureTakeProfit(const ulong ticket, const long type, const double openPric
   }
 
 //+------------------------------------------------------------------+
-//| Lot berbasis risiko (nilai tick broker)                           |
+//| Jumlah level maksimum yang bisa terisi di satu arah               |
+//+------------------------------------------------------------------+
+int GridLevels()
+  {
+   return MathMax(1, MathMin(InpMaxLevelsPerSide, InpMaxTotalPositions));
+  }
+
+//+------------------------------------------------------------------+
+//| Jarak harga total jika grid satu arah terisi penuh lalu harga     |
+//| mencapai grid stop (satu step setelah level terakhir).            |
+//| Level k (0..n-1) berjarak (n-k) step ke stop -> step*n(n+1)/2.    |
+//+------------------------------------------------------------------+
+double FullGridDistance()
+  {
+   int n = GridLevels();
+   return g_step * (double)(n * (n + 1)) / 2.0;
+  }
+
+//+------------------------------------------------------------------+
+//| Lot dari risiko GRID PENUH (bukan per posisi)                     |
 //+------------------------------------------------------------------+
 double CalcRiskLot()
   {
    if(!InpUseRiskLot || InpRiskPercent <= 0.0)
-      return NormalizeLot(InpLot);
+      return g_lot;
 
    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   if(tickValue <= 0.0 || tickSize <= 0.0)
-      return NormalizeLot(InpLot);
+   if(tickValue <= 0.0 || tickSize <= 0.0 || g_step <= 0.0)
+      return g_lot;
 
    double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
    double riskMoney = equity * InpRiskPercent / 100.0;
-   double atr       = (ArraySize(g_atrBuf) > 1) ? g_atrBuf[1] : 0.0;
-   double riskDist  = MathMax(g_step, atr);
-   if(riskDist <= 0.0)
-      return NormalizeLot(InpLot);
+   double lossPerLot = (FullGridDistance() / tickSize) * tickValue; // rugi grid penuh untuk 1.00 lot
+   if(lossPerLot <= 0.0 || riskMoney <= 0.0)
+      return g_lot;
 
-   double ticks = riskDist / tickSize;
-   if(ticks <= 0.0)
-      return NormalizeLot(InpLot);
-
-   double lot = riskMoney / (ticks * tickValue);
-   if(lot <= 0.0)
-      return NormalizeLot(InpLot);
+   double lot  = riskMoney / lossPerLot;
+   double vmin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   if(lot < vmin)
+     {
+      if(!g_warnedMinLot && equity > 0.0)
+        {
+         PrintFormat("PERINGATAN: lot risiko %.4f < lot minimum %.2f. Dengan lot minimum, risiko grid penuh = %.2f%% equity (target %.2f%%).",
+                     lot, vmin, lossPerLot * vmin / equity * 100.0, InpRiskPercent);
+         g_warnedMinLot = true;
+        }
+      return NormalizeLot(vmin);
+     }
+   g_warnedMinLot = false;
    return NormalizeLot(lot);
+  }
+
+//+------------------------------------------------------------------+
+//| Filter berita: ambil jadwal rilis dari kalender ekonomi MT5       |
+//| (waktu kalender = waktu server, TimeTradeServer).                 |
+//| Kalender tidak tersedia di Strategy Tester -> filter tidak aktif. |
+//+------------------------------------------------------------------+
+void RefreshNews()
+  {
+   if(!InpUseNewsFilter)
+      return;
+   datetime now = TimeTradeServer();
+   if(now < g_newsNextRefresh)
+      return;
+   g_newsNextRefresh = now + 300;
+
+   ArrayResize(g_newsTimes, 0);
+   MqlCalendarValue values[];
+   ResetLastError();
+   bool calOk = CalendarValueHistory(values, now - InpNewsMinutesAfter * 60, now + 24 * 3600, NULL, InpNewsCurrency);
+   int  err   = GetLastError();
+   int  n     = ArraySize(values);
+   if(!calOk || n <= 0)
+     {
+      if(err != 0 && g_newsAvailable)
+        {
+         PrintFormat("Kalender ekonomi tidak tersedia (error %d) - filter berita tidak aktif untuk sementara.", err);
+         g_newsAvailable = false;
+        }
+      return;
+     }
+   g_newsAvailable = true;
+
+   for(int i = 0; i < n; i++)
+     {
+      MqlCalendarEvent ev;
+      if(!CalendarEventById(values[i].event_id, ev))
+         continue;
+      bool relevant = (ev.importance == CALENDAR_IMPORTANCE_HIGH) ||
+                      (!InpNewsHighOnly && ev.importance == CALENDAR_IMPORTANCE_MODERATE);
+      if(!relevant)
+         continue;
+      int sz = ArraySize(g_newsTimes);
+      ArrayResize(g_newsTimes, sz + 1);
+      g_newsTimes[sz] = values[i].time;
+     }
+  }
+
+bool InNewsWindow()
+  {
+   if(!InpUseNewsFilter)
+      return false;
+   datetime now = TimeTradeServer();
+   for(int i = 0; i < ArraySize(g_newsTimes); i++)
+     {
+      if(now >= g_newsTimes[i] - InpNewsMinutesBefore * 60 &&
+         now <= g_newsTimes[i] + InpNewsMinutesAfter * 60)
+         return true;
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Grid stop: pasang SL bersama pada posisi yang belum punya SL.     |
+//| Bila harga sudah melewati level stop, posisi ditutup.             |
+//+------------------------------------------------------------------+
+void EnsureGridStops(const double buySL, const double sellSL,
+                     const double firstBuy, const double firstSell)
+  {
+   if(!InpUseGridStop || g_step <= 0.0)
+      return;
+   int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   int    n      = GridLevels();
+   double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !IsOurSelectedPosition())
+         continue;
+      if(PositionGetDouble(POSITION_SL) > 0.0)
+         continue;
+
+      long   type   = PositionGetInteger(POSITION_TYPE);
+      bool   isBuy  = (type == POSITION_TYPE_BUY);
+      double target = 0.0;
+      if(isBuy)
+         target = (buySL > 0.0) ? buySL : firstBuy - g_step * n;
+      else
+         target = (sellSL > 0.0) ? sellSL : firstSell + g_step * n;
+      if(target <= 0.0)
+         continue;
+      target = NormalizeDouble(target, digits);
+
+      if((isBuy && bid <= target) || (!isBuy && ask >= target))
+        {
+         if(!g_trade.PositionClose(ticket, InpSlippagePoints))
+            PrintFormat("Gagal menutup #%I64u di level grid stop: retcode %u (%s)", ticket,
+                        g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription());
+         continue;
+        }
+      if(!g_trade.PositionModify(ticket, target, PositionGetDouble(POSITION_TP)))
+         PrintFormat("Gagal memasang grid stop untuk #%I64u: retcode %u (%s)", ticket,
+                     g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription());
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -309,7 +454,8 @@ bool ComputeStructure()
    g_lastSL = sl;
    g_prevSL = psl;
 
-   double closeLast = g_clBuf[0];
+   //--- Array tidak di-set series: indeks need-1 = bar tertutup terakhir, indeks 0 = bar tertua
+   double closeLast = g_clBuf[need - 1];
    double emaF      = g_emaFastBuf[1];
    double emaS      = g_emaSlowBuf[1];
 
@@ -413,7 +559,7 @@ void UpdateComment(const int buyCount, const int sellCount, const int totalPos,
       "ATR: %.2f | Step: %.2f | TP: %.2f\n"
       "Mengambang: %.2f | Equity: %.2f | HWM: %.2f\n"
       "Struktur: SH %.2f / SL %.2f%s%s%s%s\n"
-      "Spread: %.2f (maks %.2f)%s",
+      "Spread: %.2f (maks %.2f)%s%s",
       dir, buyCount, sellCount, InpMaxLevelsPerSide, totalPos, InpMaxTotalPositions,
       atr, g_step, g_tp, floating, equity, g_hwmEquity,
       g_lastSH, g_lastSL,
@@ -423,13 +569,14 @@ void UpdateComment(const int buyCount, const int sellCount, const int totalPos,
       g_bearCHoCH ? " [CHoCH-]" : "",
       SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID),
       InpMaxSpread,
-      (InpUseSession && !InSession()) ? " | LUAR SESI" : ""));
+      (InpUseSession && !InSession()) ? " | LUAR SESI" : "",
+      InNewsWindow() ? " | JEDA BERITA" : ""));
   }
 
 //+------------------------------------------------------------------+
 //| Buka satu posisi grid dengan semua pengecekan                     |
 //+------------------------------------------------------------------+
-bool OpenPosition(const ENUM_ORDER_TYPE type, const MqlTick &tick)
+bool OpenPosition(const ENUM_ORDER_TYPE type, const MqlTick &tick, const double sideSL)
   {
    int    digits      = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    double point       = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
@@ -450,6 +597,25 @@ bool OpenPosition(const ENUM_ORDER_TYPE type, const MqlTick &tick)
                   tpDistance, minDist);
       ScheduleRetry(60);
       return false;
+     }
+
+   //--- Grid stop: posisi pertama menetapkan SL bersama (n step dari entry),
+   //--- level berikutnya memakai SL yang sama.
+   double sl = 0.0;
+   if(InpUseGridStop)
+     {
+      if(sideSL > 0.0)
+         sl = sideSL;
+      else
+         sl = isBuy ? price - g_step * GridLevels() : price + g_step * GridLevels();
+      sl = NormalizeDouble(sl, digits);
+      double slDistance = isBuy ? (tick.bid - sl) : (sl - tick.ask);
+      if(sl <= 0.0 || slDistance <= minDist)
+        {
+         //--- Level baru akan berada di/terlalu dekat grid stop (mis. ATR melebar): jangan buka.
+         ScheduleRetry(60);
+         return false;
+        }
      }
 
    //--- Lot berbasis risiko
@@ -484,8 +650,8 @@ bool OpenPosition(const ENUM_ORDER_TYPE type, const MqlTick &tick)
      }
 
    //--- Kirim order
-   bool sent = isBuy ? g_trade.Buy(lot, _Symbol, price, 0.0, tp, "grid")
-                     : g_trade.Sell(lot, _Symbol, price, 0.0, tp, "grid");
+   bool sent = isBuy ? g_trade.Buy(lot, _Symbol, price, sl, tp, "grid")
+                     : g_trade.Sell(lot, _Symbol, price, sl, tp, "grid");
    uint rc = g_trade.ResultRetcode();
    if(!sent || (rc != TRADE_RETCODE_DONE && rc != TRADE_RETCODE_PLACED && rc != TRADE_RETCODE_DONE_PARTIAL))
      {
@@ -523,7 +689,8 @@ int OnInit()
       InpMaxDrawdownPct <= 0.0 || InpMaxDrawdownPct >= 100.0 ||
       InpMaxEquityDrawdownPct < 0.0 || InpMaxEquityDrawdownPct >= 100.0 ||
       InpBasketProfitPct < 0.0 || InpMinMarginLevel < 0.0 || InpMaxSpread <= 0.0 ||
-      InpMaxFailBeforeHalt < 1)
+      InpMaxFailBeforeHalt < 1 || InpCooldownAfterStopMin < 0 ||
+      InpNewsMinutesBefore < 0 || InpNewsMinutesAfter < 0)
      {
       Print("Parameter tidak valid. Periksa kembali input EA.");
       return INIT_PARAMETERS_INCORRECT;
@@ -584,18 +751,58 @@ int OnInit()
 
    g_halted = GlobalVariableCheck(g_haltVar) && GlobalVariableGet(g_haltVar) > 0.0;
 
+   //--- High-water mark. Saat first-run (atau setelah reset), pakai MAKS(balance, equity):
+   //--- jika akun sudah punya rugi mengambang, rugi itu ikut terhitung sebagai drawdown,
+   //--- bukan diam-diam dijadikan titik nol baru.
+   double initBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double initEquity  = AccountInfoDouble(ACCOUNT_EQUITY);
    if(GlobalVariableCheck(g_hwmVar))
       g_hwmEquity = GlobalVariableGet(g_hwmVar);
    else
-      g_hwmEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+     {
+      g_hwmEquity = MathMax(initBalance, initEquity);
+      GlobalVariableSet(g_hwmVar, g_hwmEquity);
+      PrintFormat("HWM awal = %.2f (maks balance %.2f / equity %.2f).", g_hwmEquity, initBalance, initEquity);
+     }
+
+   //--- Periksa posisi yang sudah ada di akun
+   int    ourPos = 0, otherPos = 0;
+   double ourFloating = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+      if(IsOurSelectedPosition())
+        {
+         ourPos++;
+         ourFloating += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+        }
+      else
+         otherPos++;
+     }
+   if(ourPos > 0)
+     {
+      PrintFormat("PERINGATAN: ada %d posisi EA ini dari sesi sebelumnya (mengambang %.2f). EA akan terus mengelolanya (TP, grid stop, stop DD).",
+                  ourPos, ourFloating);
+      if(initBalance > 0.0 && ourFloating <= -initBalance * InpMaxDrawdownPct / 100.0)
+         Print("PERINGATAN: rugi posisi itu sudah melewati batas stop DD - posisi akan langsung ditutup pada tick pertama.");
+     }
+   if(otherPos > 0)
+      PrintFormat("PERINGATAN: ada %d posisi lain (manual/EA lain) di akun ini. Circuit breaker equity memakai equity SELURUH akun, jadi posisi itu ikut memengaruhinya.",
+                  otherPos);
+   if(initEquity < initBalance)
+      PrintFormat("PERINGATAN: equity %.2f di bawah balance %.2f - akun sedang rugi mengambang %.2f.",
+                  initEquity, initBalance, initBalance - initEquity);
 
    if(g_halted)
       Comment("GridXAUUSD BERHENTI (stop sebelumnya).\nPasang ulang EA dengan InpResetHalt = true.");
 
-   PrintFormat("GridXAUUSD v2 aktif: %s, mode %s, lot %.2f (risiko %.2f%%), step ATR x%.2f, TP ATR x%.2f, maks %d/arah, total maks %d",
+   PrintFormat("GridXAUUSD v2.1 aktif: %s, mode %s, lot %.2f (risiko grid %.2f%%), step ATR x%.2f, TP ATR x%.2f, maks %d/arah, total maks %d, grid stop %s, filter berita %s",
                _Symbol, (InpMode == GRID_STRUCTURE ? "STRUCTURE" : "BOTH"),
                g_lot, InpRiskPercent, InpGridStepAtrMult, InpTakeProfitAtrMult,
-               InpMaxLevelsPerSide, InpMaxTotalPositions);
+               InpMaxLevelsPerSide, InpMaxTotalPositions,
+               InpUseGridStop ? "ON" : "OFF", InpUseNewsFilter ? InpNewsCurrency : "OFF");
    return INIT_SUCCEEDED;
   }
 
@@ -614,6 +821,35 @@ void OnDeinit(const int reason)
   }
 
 //+------------------------------------------------------------------+
+//| Deteksi grid stop kena -> jeda sebelum grid baru                  |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
+  {
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD || trans.deal == 0)
+      return;
+   if(!HistoryDealSelect(trans.deal))
+      return;
+   if(HistoryDealGetString(trans.deal, DEAL_SYMBOL) != _Symbol)
+      return;
+   if((ulong)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != InpMagic)
+      return;
+   if(HistoryDealGetInteger(trans.deal, DEAL_ENTRY) != DEAL_ENTRY_OUT)
+      return;
+   if(HistoryDealGetInteger(trans.deal, DEAL_REASON) != DEAL_REASON_SL)
+      return;
+
+   if(InpCooldownAfterStopMin > 0)
+     {
+      datetime until = TimeCurrent() + InpCooldownAfterStopMin * 60;
+      if(until > g_nextTryTime)
+         g_nextTryTime = until;
+      PrintFormat("Grid stop kena (deal #%I64u). Grid baru ditunda %d menit.", trans.deal, InpCooldownAfterStopMin);
+     }
+  }
+
+//+------------------------------------------------------------------+
 //| Setiap tick                                                       |
 //+------------------------------------------------------------------+
 void OnTick()
@@ -626,10 +862,13 @@ void OnTick()
       return;
 
    ComputeStructure();
+   RefreshNews();
 
    //--- Kumpulkan posisi milik EA ini
    int    buyCount = 0, sellCount = 0;
    double lowestBuy = DBL_MAX, highestSell = -DBL_MAX;
+   double firstBuy = 0.0, firstSell = DBL_MAX;  // buy tertinggi / sell terendah = level pertama
+   double buySL = 0.0, sellSL = 0.0;            // SL bersama yang sudah terpasang
    double floating = 0.0;
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -644,11 +883,16 @@ void OnTick()
       floating += PositionGetDouble(POSITION_PROFIT)
                 + PositionGetDouble(POSITION_SWAP);
 
+      double posSL = PositionGetDouble(POSITION_SL);
       if(type == POSITION_TYPE_BUY)
         {
          buyCount++;
          if(openPrice < lowestBuy)
             lowestBuy = openPrice;
+         if(openPrice > firstBuy)
+            firstBuy = openPrice;
+         if(posSL > 0.0 && buySL <= 0.0)
+            buySL = posSL;
         }
       else
          if(type == POSITION_TYPE_SELL)
@@ -656,10 +900,16 @@ void OnTick()
             sellCount++;
             if(openPrice > highestSell)
                highestSell = openPrice;
+            if(openPrice < firstSell)
+               firstSell = openPrice;
+            if(posSL > 0.0 && sellSL <= 0.0)
+               sellSL = posSL;
            }
 
       EnsureTakeProfit(ticket, type, openPrice, tp);
      }
+
+   EnsureGridStops(buySL, sellSL, firstBuy, (firstSell < DBL_MAX) ? firstSell : 0.0);
 
    int    totalPos = buyCount + sellCount;
    double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
@@ -719,6 +969,8 @@ void OnTick()
       return;
    if(InpUseSession && !InSession())
       return;
+   if(InNewsWindow())
+      return;
    if(totalPos >= InpMaxTotalPositions)
       return;
 
@@ -731,14 +983,14 @@ void OnTick()
            {
             if(CanEnterBuy(tick))
               {
-               OpenPosition(ORDER_TYPE_BUY, tick);
+               OpenPosition(ORDER_TYPE_BUY, tick, buySL);
                return;
               }
            }
          else
             if(buyCount < InpMaxLevelsPerSide && tick.ask <= lowestBuy - g_step)
               {
-               OpenPosition(ORDER_TYPE_BUY, tick);
+               OpenPosition(ORDER_TYPE_BUY, tick, buySL);
                return;
               }
         }
@@ -749,14 +1001,14 @@ void OnTick()
               {
                if(CanEnterSell(tick))
                  {
-                  OpenPosition(ORDER_TYPE_SELL, tick);
+                  OpenPosition(ORDER_TYPE_SELL, tick, sellSL);
                   return;
                  }
               }
             else
                if(sellCount < InpMaxLevelsPerSide && tick.bid >= highestSell + g_step)
                  {
-                  OpenPosition(ORDER_TYPE_SELL, tick);
+                  OpenPosition(ORDER_TYPE_SELL, tick, sellSL);
                   return;
                  }
            }
@@ -767,14 +1019,14 @@ void OnTick()
    if(buyCount < InpMaxLevelsPerSide &&
       (buyCount == 0 || tick.ask <= lowestBuy - g_step))
      {
-      OpenPosition(ORDER_TYPE_BUY, tick);
+      OpenPosition(ORDER_TYPE_BUY, tick, buySL);
       return;
      }
 
    if(sellCount < InpMaxLevelsPerSide &&
       (sellCount == 0 || tick.bid >= highestSell + g_step))
      {
-      OpenPosition(ORDER_TYPE_SELL, tick);
+      OpenPosition(ORDER_TYPE_SELL, tick, sellSL);
       return;
      }
   }
